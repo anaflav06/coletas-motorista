@@ -337,20 +337,64 @@ def separar_programacao(rows, agora=None):
 def cargas_no_veiculo(rows):
     return [r for r in rows if r.get("status") == "COLETADO"]
 
-def proxima_acao(rows, hoje, futuro):
+def rota_manual_ativa_para(r, data_ref):
+    return (
+        parse_date(r.get("programado_para")) == data_ref
+        and int(r.get("rota_manual_ordem") or 0) > 0
+    )
+
+def rota_manual_proxima(rows, data_ref):
+    candidatos = [
+        r for r in rows
+        if rota_manual_ativa_para(r, data_ref)
+        and r.get("status","PENDENTE") in ("PENDENTE","LIBERADA","EM ROTA")
+    ]
+    return sorted(candidatos, key=lambda x: int(x.get("rota_manual_ordem") or 999)) if candidatos else []
+
+def checkpoint_loja_pendente(rows, data_ref):
+    """Retorna True quando a última coleta feita na rota manual exige retorno à loja antes da próxima parada."""
     cargas = cargas_no_veiculo(rows)
-    # Ordem manual "Próxima coleta" vence qualquer sugestão automática.
+    if not cargas:
+        return False
+    for r in cargas:
+        if parse_date(r.get("programado_para")) == data_ref and bool(r.get("voltar_loja_depois")):
+            return True
+    return False
+
+def proxima_acao(rows, hoje, futuro):
+    agora = datetime.now()
+    data_ref = agora.date()
+    cargas = cargas_no_veiculo(rows)
+
+    # Ordem direta definida manualmente como "Próxima coleta" prevalece.
     for r in hoje:
         if r.get("prioridade_operacional") == "Próxima coleta" and r.get("status") in ("PENDENTE","LIBERADA","EM ROTA"):
             return "COLETA", r
+
+    # Em rota manual, um checkpoint de loja interrompe a sequência.
+    if checkpoint_loja_pendente(rows, data_ref):
+        return "LOJA", cargas
+
+    manual = rota_manual_proxima(rows, data_ref)
+    if manual:
+        em_execucao = [r for r in manual if r.get("status") in ("LIBERADA","EM ROTA")]
+        if em_execucao:
+            return "COLETA", em_execucao[0]
+        # Se há carga no veículo, só continua para a próxima coleta quando o roteiro manual
+        # não pediu retorno à loja após a coleta anterior.
+        return "COLETA", manual[0]
+
     em_execucao = [r for r in hoje if r.get("status") in ("LIBERADA","EM ROTA")]
     if em_execucao:
-        return "COLETA", sorted(em_execucao, key=ordem_operacional)[0]
+        return "COLETA", sorted(em_execucao,key=ordem_operacional)[0]
+
+    # Fora de rota manual, ao terminar o ciclo atual, descarrega na loja.
     if cargas:
         return "LOJA", cargas
-    pendentes_hoje = [r for r in hoje if r.get("status","PENDENTE") == "PENDENTE"]
+
+    pendentes_hoje=[r for r in hoje if r.get("status","PENDENTE")=="PENDENTE"]
     if pendentes_hoje:
-        return "COLETA", sorted(pendentes_hoje, key=ordem_operacional)[0]
+        return "COLETA", sorted(pendentes_hoje,key=ordem_operacional)[0]
     return "CONCLUIDO", futuro
 
 def resumo_whatsapp(rows, agora=None):
@@ -504,7 +548,8 @@ def coleta_card(rows, r, prox_data):
                 r["prioridade_operacional"] = "Normal"
             r["ordem_manual"] = None
             save(rows)
-            st.session_state["painel"] = "PROXIMA"
+            st.session_state["menu_principal"] = "📍 Planejamento"
+            st.session_state["painel_planejamento"] = "PROXIMA"
             st.session_state["flash_operacional"] = f"✅ Coleta {r.get('num_coleta','')} confirmada como coletada."
             st.rerun()
     elif status == "EM ROTA":
@@ -624,7 +669,11 @@ if menu == "📍 Planejamento":
                 agora_txt=datetime.now().isoformat(timespec="seconds")
                 for base in rows:
                     if base.get("status")=="COLETADO": registrar_status(base,"ENTREGUE NA LOJA",st.session_state.get("usuario","")); base["entregue_loja_em"]=agora_txt
-                save(rows); st.rerun()
+                save(rows)
+                st.session_state["menu_principal"]="📍 Planejamento"
+                st.session_state["painel_planejamento"]="PROXIMA"
+                st.session_state["flash_operacional"]="🏢 Coletas descarregadas na loja. Próxima ação recalculada."
+                st.rerun()
         else:
             st.subheader("✅ Operação atual concluída")
             st.success(f"Não há outra coleta prevista para agora. Próximas programadas para {data_br(prox_data)}." if futuro else "Não há outra coleta pendente para agora.")
@@ -681,27 +730,42 @@ elif menu == "🗺️ Rota manual":
     st.subheader("🗺️ Montar rota manual")
     data_rota=st.date_input("Data da rota",value=prox_data)
     candidatos=[r for r in rows if r.get("status","PENDENTE") not in ("COLETADO","ENTREGUE NA LOJA","FINALIZADO","CANCELADO") and (parse_date(r.get("programado_para")) in (None,data_rota) or data_rota==prox_data)]
-    st.caption("Defina 1, 2, 3... para a sequência desejada. Zero deixa a coleta fora da rota manual. A rota manual prevalece sobre a sugestão automática.")
+    st.caption("Defina 1, 2, 3... para a sequência. Marque 🏢 quando o motorista precisar voltar à loja e descarregar antes de continuar.")
     with st.form("rota_manual_form",enter_to_submit=False):
-        ordens={}
+        ordens={}; retornos={}
         for r in sorted(candidatos,key=ordem_futuro):
-            c1,c2=st.columns([5,1])
+            c1,c2,c3=st.columns([5,1,2])
             c1.markdown(f"**{r.get('cliente','')}** · {r.get('cep','')} · Coleta {r.get('num_coleta','')} · {money(r.get('valor_nf',0))}")
-            atual=int(r.get("rota_manual_ordem") or 0) if parse_date(r.get("programado_para"))==data_rota else 0
+            mesma_data=parse_date(r.get("programado_para"))==data_rota
+            atual=int(r.get("rota_manual_ordem") or 0) if mesma_data else 0
             ordens[r['id']]=c2.number_input("Ordem",min_value=0,max_value=99,value=atual,step=1,key=f"ord_{r['id']}",label_visibility="collapsed")
+            retornos[r['id']]=c3.checkbox("🏢 Loja depois",value=bool(r.get("voltar_loja_depois")) if mesma_data else False,key=f"loja_{r['id']}")
         salvar_rota=st.form_submit_button("💾 Salvar rota manual",type="primary",use_container_width=True)
     if salvar_rota:
         usados=[v for v in ordens.values() if v>0]
-        if len(usados)!=len(set(usados)): st.error("Não repita o mesmo número de ordem em duas coletas.")
+        if len(usados)!=len(set(usados)):
+            st.error("Não repita o mesmo número de ordem em duas coletas.")
         else:
             for r in rows:
                 if r.get("id") in ordens:
-                    o=int(ordens[r['id']]); r["rota_manual_ordem"]=o if o>0 else None
-                    if o>0: r["programado_para"]=data_rota.isoformat()
-            save(rows); st.success("✅ Rota manual salva com sucesso.")
+                    o=int(ordens[r['id']])
+                    r["rota_manual_ordem"]=o if o>0 else None
+                    r["voltar_loja_depois"]=bool(retornos[r['id']]) if o>0 else False
+                    if o>0:
+                        r["programado_para"]=data_rota.isoformat()
+            save(rows)
+            st.success("✅ Rota manual salva com os retornos à loja.")
+    st.markdown("#### 👀 Sequência da rota")
+    selecionadas=[r for r in candidatos if int(ordens.get(r.get("id"),0) or 0)>0]
+    for r in sorted(selecionadas,key=lambda x:int(ordens.get(x.get("id"),999))):
+        st.write(f"**{int(ordens[r['id']])}. {r.get('cliente','')}** — {r.get('cep','')}")
+        if retornos.get(r["id"]):
+            st.info("🏢 Depois desta coleta: LEVAR AS COLETAS PARA A LOJA")
     if st.button("↩️ Voltar esta data para rota automática",use_container_width=True):
         for r in rows:
-            if parse_date(r.get("programado_para"))==data_rota: r["rota_manual_ordem"]=None
+            if parse_date(r.get("programado_para"))==data_rota:
+                r["rota_manual_ordem"]=None
+                r["voltar_loja_depois"]=False
         save(rows); st.rerun()
 
 else:
@@ -719,4 +783,5 @@ else:
         if escolha: formulario_edicao(rows,opcoes[escolha])
     else: st.info("Nenhum registro.")
 
-st.caption("Controle de Coletas · V1.9.1 GitHub/Streamlit")
+st.session_state["_menu_anterior"] = menu
+st.caption("Controle de Coletas · V1.10 GitHub/Streamlit")
