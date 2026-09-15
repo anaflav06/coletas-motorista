@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 import requests
 import base64
-import hashlib
+from io import BytesIO
 
 st.set_page_config(page_title="Controle de Coletas", page_icon="🚚", layout="wide")
 
@@ -211,12 +211,65 @@ def parse_date(value):
     except Exception:
         return None
 
+def prioridade_manual_rank(r):
+    p = str(r.get("prioridade_operacional", "Normal"))
+    return {"Próxima coleta": 0, "Prioritária": 1, "Normal": 2}.get(p, 2)
+
 def ordem_operacional(r):
-    # BRAMSYS/FARMATEC têm prioridade, mas podem compartilhar a viagem com 040–043.
-    # Dentro de uma mesma região/cabeça compatível: NF menor primeiro e NF maior por último.
-    pri = 0 if priority(r.get("cliente")) else 1
-    rg = {"MUITO PERTO":0, "PERTO":1, "LONGE":2}.get(regiao(r.get("cep")), 3)
-    return (pri, rg, head(r.get("cep")), float(r.get("valor_nf") or 0))
+    # Intervenção manual sempre prevalece. Depois entram prioridades comerciais e a rota automática.
+    manual = prioridade_manual_rank(r)
+    pri_cliente = 0 if priority(r.get("cliente")) else 1
+    rg = {"LONGE":0, "PERTO":1, "MUITO PERTO":2}.get(regiao(r.get("cep")), 3)
+    # NF menor antes da maior quando as coletas são compatíveis no mesmo roteiro.
+    return (manual, pri_cliente, rg, -head(r.get("cep")), float(r.get("valor_nf") or 0))
+
+def ordem_futuro(r):
+    # Rota manual salva para a data tem precedência absoluta.
+    ordem = r.get("rota_manual_ordem")
+    if ordem not in (None, "", 0, "0"):
+        try:
+            return (0, int(ordem), 0, 0, 0)
+        except Exception:
+            pass
+    # Automático: manhã começa mais longe e volta em direção à loja; 040–043 ficam por último.
+    h = head(r.get("cep"))
+    faixa = 2 if h in MUITO_PERTO else (1 if h in PERTO else 0)
+    return (1, faixa, -h, float(r.get("valor_nf") or 0), str(r.get("cliente", "")))
+
+def registrar_status(r, novo_status, usuario):
+    anterior = r.get("status", "PENDENTE")
+    if anterior == novo_status:
+        return
+    hist = r.setdefault("historico_status", [])
+    hist.append({"em": datetime.now().isoformat(timespec="seconds"), "usuario": usuario,
+                 "de": anterior, "para": novo_status})
+    r["status"] = novo_status
+    if novo_status not in ("COLETADO", "ENTREGUE NA LOJA"):
+        r.pop("coletado_em", None)
+        r.pop("entregue_loja_em", None)
+    if novo_status != "ENTREGUE NA LOJA":
+        r.pop("entregue_loja_em", None)
+
+def rota_futura_grupos(futuro):
+    ordenados = sorted(futuro, key=ordem_futuro)
+    # Se houver rota manual, respeitamos exatamente a sequência escolhida.
+    if any(r.get("rota_manual_ordem") for r in ordenados):
+        return [("ROTA MANUAL", ordenados)]
+    manha, tarde = [], []
+    for r in ordenados:
+        h = head(r.get("cep"))
+        # Faixas muito deslocadas do eixo da base (ex.: 095) ficam como ciclo após almoço.
+        if h >= 90:
+            tarde.append(r)
+        else:
+            manha.append(r)
+    # Coletas 040–043 podem completar o retorno de qualquer ciclo; se existe rota longa isolada à tarde,
+    # elas ficam disponíveis para agrupamento no retorno desse ciclo.
+    if tarde:
+        perto_base = [r for r in manha if head(r.get("cep")) in MUITO_PERTO]
+        manha = [r for r in manha if r not in perto_base]
+        tarde.extend(sorted(perto_base, key=lambda r: float(r.get("valor_nf") or 0)))
+    return [("ROTA 1 — MANHÃ", manha), ("ROTA 2 — APÓS O ALMOÇO", tarde)]
 
 def separar_programacao(rows, agora=None):
     agora = agora or datetime.now()
@@ -257,7 +310,7 @@ def separar_programacao(rows, agora=None):
             futuro.append(r)
 
     hoje.sort(key=ordem_operacional)
-    futuro.sort(key=ordem_operacional)
+    futuro.sort(key=ordem_futuro)
     sem_cep.sort(key=ordem_operacional)
     return hoje, futuro, sem_cep
 
@@ -266,21 +319,18 @@ def cargas_no_veiculo(rows):
 
 def proxima_acao(rows, hoje, futuro):
     cargas = cargas_no_veiculo(rows)
-
-    # Se há coleta já liberada/em rota, ela sempre é a ação principal.
+    # Ordem manual "Próxima coleta" vence qualquer sugestão automática.
+    for r in hoje:
+        if r.get("prioridade_operacional") == "Próxima coleta" and r.get("status") in ("PENDENTE","LIBERADA","EM ROTA"):
+            return "COLETA", r
     em_execucao = [r for r in hoje if r.get("status") in ("LIBERADA","EM ROTA")]
     if em_execucao:
-        return "COLETA", em_execucao[0]
-
-    # Após concluir uma coleta, primeiro retornar a carga à loja.
+        return "COLETA", sorted(em_execucao, key=ordem_operacional)[0]
     if cargas:
         return "LOJA", cargas
-
-    # De volta à loja, recalculamos e podemos liberar nova coleta viável.
     pendentes_hoje = [r for r in hoje if r.get("status","PENDENTE") == "PENDENTE"]
     if pendentes_hoje:
-        return "COLETA", pendentes_hoje[0]
-
+        return "COLETA", sorted(pendentes_hoje, key=ordem_operacional)[0]
     return "CONCLUIDO", futuro
 
 def resumo_whatsapp(rows, agora=None):
@@ -288,37 +338,34 @@ def resumo_whatsapp(rows, agora=None):
     hoje, futuro, sem_cep = separar_programacao(rows, agora)
     prox = proximo_dia_util(agora)
     cargas = cargas_no_veiculo(rows)
-
     linhas = ["🚚 *PROGRAMAÇÃO DE COLETAS*", f"📅 *{agora.strftime('%d/%m/%Y')}*", ""]
-
     if cargas:
-        linhas += ["🏢 *AÇÃO ATUAL — RETORNAR À LOJA*"]
+        linhas.append("🏢 *AÇÃO ATUAL — LEVAR AS COLETAS PARA A LOJA*")
         for r in cargas:
             linhas.append(f"• *{r.get('cliente','')}* | {r.get('cep','')} | Coleta {r.get('num_coleta','')}")
         linhas.append("")
-
     linhas.append("📍 *PREVISTAS PARA HOJE*")
-    ativos = [r for r in hoje if r.get("status") not in ("COLETADO","ENTREGUE NA LOJA")]
+    ativos=[r for r in hoje if r.get("status") not in ("COLETADO","ENTREGUE NA LOJA")]
     if ativos:
-        for i, r in enumerate(ativos, 1):
-            estrela = "⭐ " if priority(r.get("cliente")) else ""
-            linhas.append(f"{i}. {estrela}*{r.get('cliente','')}* | {r.get('cep','')} | Coleta {r.get('num_coleta','')} | NF {money(r.get('valor_nf',0))}")
+        for i,r in enumerate(sorted(ativos,key=ordem_operacional),1):
+            tag="🚨 " if r.get("prioridade_operacional")=="Próxima coleta" else ("⭐ " if priority(r.get("cliente")) or r.get("prioridade_operacional")=="Prioritária" else "")
+            linhas.append(f"{i}. {tag}*{r.get('cliente','')}* | {r.get('cep','')} | Coleta {r.get('num_coleta','')} | NF {money(r.get('valor_nf',0))}")
     else:
         linhas.append("• Nenhuma coleta pendente para hoje.")
-
     linhas += ["", f"🌅 *PRÓXIMO DIA ÚTIL — {data_br(prox)}*"]
-    if futuro:
-        for i, r in enumerate(futuro, 1):
-            estrela = "⭐ " if priority(r.get("cliente")) else ""
-            linhas.append(f"{i}. {estrela}*{r.get('cliente','')}* | {r.get('cep','')} | Coleta {r.get('num_coleta','')}")
-    else:
-        linhas.append("• Nenhuma coleta programada.")
-
+    grupos=rota_futura_grupos(futuro)
+    houve=False
+    for nome,grupo in grupos:
+        if not grupo: continue
+        houve=True; linhas += ["", f"🚚 *{nome}*"]
+        for i,r in enumerate(grupo,1):
+            tag="🚨 " if r.get("prioridade_operacional")=="Próxima coleta" else ("⭐ " if priority(r.get("cliente")) or r.get("prioridade_operacional")=="Prioritária" else "")
+            linhas.append(f"{i}. {tag}*{r.get('cliente','')}* | {r.get('cep','')} | Coleta {r.get('num_coleta','')}")
+        linhas.append("🏢 *Retornar e deixar as coletas na loja*")
+    if not houve: linhas.append("• Nenhuma coleta programada.")
     if sem_cep:
         linhas += ["", "⚠️ *PENDÊNCIAS SEM CEP*"]
-        for r in sem_cep:
-            linhas.append(f"• {r.get('num_coleta','')} — {r.get('cliente','')}")
-
+        for r in sem_cep: linhas.append(f"• {r.get('num_coleta','')} — {r.get('cliente','')}")
     return "\n".join(linhas)
 
 def money(v):
@@ -344,6 +391,56 @@ def show_items(r):
     elif r.get("volumes"):
         st.caption(f"📦 Dados importados da planilha: {r.get('volumes')}")
 
+def abrir_edicao(row_id):
+    st.session_state.edit_id = str(row_id)
+
+def formulario_edicao(rows, r):
+    st.markdown("#### ✏️ Editar coleta")
+    with st.form(f"editar_{r['id']}", enter_to_submit=False):
+        a,b,c=st.columns(3)
+        numero=a.text_input("Número da coleta", value=str(r.get("num_coleta","")))
+        cep=b.text_input("CEP", value=str(r.get("cep","")))
+        cliente=c.text_input("Cliente", value=str(r.get("cliente","")))
+        a,b,c=st.columns(3)
+        valor=a.number_input("Valor da NF", min_value=0.0, value=float(r.get("valor_nf") or 0), step=100.0, format="%.2f")
+        opcoes=["Normal","Prioritária","Próxima coleta"]
+        atual=r.get("prioridade_operacional","Normal") if r.get("prioridade_operacional","Normal") in opcoes else "Normal"
+        prioridade=a.selectbox("Prioridade operacional",opcoes,index=opcoes.index(atual))
+        statuses=["PENDENTE","LIBERADA","EM ROTA","COLETADO","ENTREGUE NA LOJA","CANCELADO"]
+        status_atual=r.get("status","PENDENTE") if r.get("status","PENDENTE") in statuses else "PENDENTE"
+        status=b.selectbox("Status operacional",statuses,index=statuses.index(status_atual))
+        prog=parse_date(r.get("programado_para")) or datetime.now().date()
+        programado=c.date_input("Programado para",value=prog)
+        obs=st.text_area("Observações",value=str(r.get("observacoes", "")))
+        x,y=st.columns(2)
+        salvar=x.form_submit_button("💾 Salvar alterações",type="primary",use_container_width=True)
+        cancelar=y.form_submit_button("Cancelar",use_container_width=True)
+    if cancelar:
+        st.session_state.edit_id=None; st.rerun()
+    if salvar:
+        cep_ok=normcep(cep)
+        if not numero.strip() or not cliente.strip() or regiao(cep_ok)=="SEM CEP":
+            st.error("Preencha número da coleta, cliente e um CEP válido.")
+        else:
+            antigo=r.get("status","PENDENTE")
+            r.update({"num_coleta":numero.strip(),"cep":cep_ok,"cliente":cliente.strip().upper(),"valor_nf":float(valor),
+                      "prioridade_operacional":prioridade,"programado_para":programado.isoformat(),"observacoes":obs.strip()})
+            if antigo != status:
+                registrar_status(r,status,st.session_state.get("usuario",""))
+                if status == "COLETADO":
+                    r["data_coleta"] = datetime.now().date().isoformat()
+                    r["coletado_em"] = datetime.now().isoformat(timespec="seconds")
+                elif status == "ENTREGUE NA LOJA":
+                    r["entregue_loja_em"] = datetime.now().isoformat(timespec="seconds")
+            # "Próxima coleta" deve ser única.
+            if prioridade=="Próxima coleta":
+                for outra in rows:
+                    if str(outra.get("id"))!=str(r.get("id")) and outra.get("prioridade_operacional")=="Próxima coleta":
+                        outra["prioridade_operacional"]="Normal"
+            save(rows); st.session_state.edit_id=None
+            st.session_state.flash=f"✅ Alterações salvas — coleta {numero.strip()} · {cliente.strip().upper()}"
+            st.rerun()
+
 def coleta_card(rows, r, prox_data):
     estrela = "⭐ " if priority(r.get("cliente")) else ""
     st.markdown(
@@ -354,28 +451,34 @@ def coleta_card(rows, r, prox_data):
         </div>""",
         unsafe_allow_html=True
     )
-    show_items(r)
     if r.get("observacoes"):
         st.caption(f"📝 {r.get('observacoes')}")
+    if r.get("prioridade_operacional") == "Próxima coleta":
+        st.error("🚨 PRIORIDADE MANUAL — PRÓXIMA COLETA")
+    elif r.get("prioridade_operacional") == "Prioritária":
+        st.warning("⭐ Prioridade operacional")
+    if st.button("✏️ Editar coleta", key=f"edit_{r['id']}", use_container_width=True):
+        abrir_edicao(r["id"]); st.rerun()
+    if str(st.session_state.get("edit_id")) == str(r.get("id")):
+        formulario_edicao(rows, r)
 
     status = r.get("status","PENDENTE")
     if status == "PENDENTE":
         a,b = st.columns(2)
         if a.button("🚚 Liberar coleta", key=f"lib_{r['id']}", use_container_width=True, type="primary"):
-            update_row(rows, r["id"], status="LIBERADA",
-                       liberada_em=datetime.now().isoformat(timespec="seconds"),
-                       programado_para=datetime.now().date().isoformat())
-            st.rerun()
+            registrar_status(r,"LIBERADA",st.session_state.get("usuario",""))
+            r["liberada_em"]=datetime.now().isoformat(timespec="seconds")
+            r["programado_para"]=datetime.now().date().isoformat(); save(rows); st.rerun()
         if b.button(f"↪️ Deixar para {data_br(prox_data)}", key=f"next_{r['id']}", use_container_width=True):
             update_row(rows, r["id"], programado_para=prox_data.isoformat())
             st.rerun()
     elif status == "LIBERADA":
         st.success("✅ Coleta liberada para o motorista.")
         if st.button("📦 Marcar como coletada", key=f"col_{r['id']}", use_container_width=True):
-            update_row(rows, r["id"], status="COLETADO",
-                       data_coleta=datetime.now().date().isoformat(),
-                       coletado_em=datetime.now().isoformat(timespec="seconds"))
-            st.rerun()
+            registrar_status(r,"COLETADO",st.session_state.get("usuario",""))
+            r["data_coleta"]=datetime.now().date().isoformat(); r["coletado_em"]=datetime.now().isoformat(timespec="seconds")
+            if r.get("prioridade_operacional")=="Próxima coleta": r["prioridade_operacional"]="Normal"
+            save(rows); st.rerun()
     elif status == "EM ROTA":
         st.info("🚚 Motorista em rota para esta coleta.")
     elif status == "COLETADO":
@@ -455,167 +558,133 @@ if github_config()[0] and github_config()[1]:
 else:
     st.caption("💻 Modo local — configure os Secrets do GitHub antes de publicar para não depender do arquivo local")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📍 Planejamento", "➕ Nova coleta", "💬 Resumo WhatsApp", "📊 Histórico / Excel"])
+menu = st.radio("Navegação", ["📍 Planejamento","➕ Nova coleta","💬 Resumo WhatsApp","🗺️ Rota manual","📊 Histórico / Excel"], horizontal=True, label_visibility="collapsed")
 
-with tab1:
-    if "painel" not in st.session_state:
+if st.session_state.get("menu_anterior") != menu:
+    if menu == "📍 Planejamento":
         st.session_state.painel = "PROXIMA"
+    st.session_state.menu_anterior = menu
 
-    acao_tipo, acao_dados = proxima_acao(rows, hoje, futuro)
-    proxima = acao_dados if acao_tipo == "COLETA" else None
-    pendentes = [r for r in rows if r.get("status","PENDENTE") not in ("COLETADO","ENTREGUE NA LOJA","FINALIZADO","CANCELADO")]
+flash = st.session_state.pop("flash", None)
+if flash:
+    st.success(flash)
 
-    c1,c2,c3,c4 = st.columns(4)
-    if c1.button(f"🚚  PRÓXIMA AÇÃO  •  {1 if acao_tipo in ('COLETA','LOJA') else 0}", use_container_width=True):
-        st.session_state.painel = "PROXIMA"
-    if c2.button(f"📍  HOJE — RESTANTES  •  {len(hoje)}", use_container_width=True):
-        st.session_state.painel = "HOJE"
-    if c3.button(f"📅  {data_br(prox_data)} — PRÓXIMO DIA ÚTIL  •  {len(futuro)}", use_container_width=True):
-        st.session_state.painel = "FUTURO"
-    if c4.button(f"⏳  PENDENTES  •  {len(pendentes)}", use_container_width=True):
-        st.session_state.painel = "PENDENTES"
-
-    st.divider()
-    painel = st.session_state.painel
-
-    if painel == "PROXIMA":
-        if acao_tipo == "COLETA" and proxima:
-            st.subheader("🚚 Próxima coleta")
-            coleta_card(rows, proxima, prox_data)
-
-        elif acao_tipo == "LOJA":
+if menu == "📍 Planejamento":
+    if "painel" not in st.session_state: st.session_state.painel="PROXIMA"
+    acao_tipo, acao_dados=proxima_acao(rows,hoje,futuro)
+    proxima=acao_dados if acao_tipo=="COLETA" else None
+    pendentes=[r for r in rows if r.get("status","PENDENTE") not in ("COLETADO","ENTREGUE NA LOJA","FINALIZADO","CANCELADO")]
+    c1,c2,c3,c4=st.columns(4)
+    if c1.button(f"🚚  PRÓXIMA AÇÃO  •  {1 if acao_tipo in ('COLETA','LOJA') else 0}",use_container_width=True): st.session_state.painel="PROXIMA"; st.rerun()
+    if c2.button(f"📍  HOJE — RESTANTES  •  {len(hoje)}",use_container_width=True): st.session_state.painel="HOJE"; st.rerun()
+    if c3.button(f"📅  {data_br(prox_data)} — PRÓXIMO DIA ÚTIL  •  {len(futuro)}",use_container_width=True): st.session_state.painel="FUTURO"; st.rerun()
+    if c4.button(f"⏳  PENDENTES  •  {len(pendentes)}",use_container_width=True): st.session_state.painel="PENDENTES"; st.rerun()
+    st.divider(); painel=st.session_state.painel
+    if painel=="PROXIMA":
+        if acao_tipo=="COLETA" and proxima:
+            st.subheader("🚚 Próxima coleta"); coleta_card(rows,proxima,prox_data)
+        elif acao_tipo=="LOJA":
             st.subheader("🏢 Próxima ação")
-            st.markdown("""
-            <div class="return-card">
-                <div class="return-icon">🏢</div>
-                <div>
-                    <div class="return-title">LEVAR AS COLETAS PARA A LOJA</div>
-                    <div class="return-sub">Retornar à base operacional — CEP 04150-010</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            cargas = acao_dados
-            st.caption(f"📦 {len(cargas)} coleta(s) no veículo aguardando retorno.")
-            for carga in cargas:
-                st.write(f"**{carga.get('num_coleta','')} — {carga.get('cliente','')}** · {carga.get('cep','')}")
-            if st.button("✅ CHEGOU NA LOJA — DESCARREGAR COLETAS", type="primary", use_container_width=True):
-                agora_txt = datetime.now().isoformat(timespec="seconds")
-                ids = {str(r.get("id")) for r in cargas}
+            st.markdown('<div class="return-card"><div class="return-icon">🏢</div><div><div class="return-title">LEVAR AS COLETAS PARA A LOJA</div><div class="return-sub">Retornar à base operacional — CEP 04150-010</div></div></div>',unsafe_allow_html=True)
+            cargas=acao_dados; st.caption(f"📦 {len(cargas)} coleta(s) no veículo aguardando retorno.")
+            for carga in cargas: st.write(f"**{carga.get('num_coleta','')} — {carga.get('cliente','')}** · {carga.get('cep','')}")
+            if st.button("✅ CHEGOU NA LOJA — DESCARREGAR COLETAS",type="primary",use_container_width=True):
+                agora_txt=datetime.now().isoformat(timespec="seconds")
                 for base in rows:
-                    if str(base.get("id")) in ids and base.get("status") == "COLETADO":
-                        base["status"] = "ENTREGUE NA LOJA"
-                        base["entregue_loja_em"] = agora_txt
-                save(rows)
-                st.rerun()
-
+                    if base.get("status")=="COLETADO": registrar_status(base,"ENTREGUE NA LOJA",st.session_state.get("usuario","")); base["entregue_loja_em"]=agora_txt
+                save(rows); st.rerun()
         else:
             st.subheader("✅ Operação atual concluída")
-            if futuro:
-                st.success(f"Não há outra coleta prevista para agora. Próximas programadas para {data_br(prox_data)}.")
-            else:
-                st.success("Não há outra coleta pendente para agora.")
-
-    elif painel == "HOJE":
+            st.success(f"Não há outra coleta prevista para agora. Próximas programadas para {data_br(prox_data)}." if futuro else "Não há outra coleta pendente para agora.")
+    elif painel=="HOJE":
         st.subheader("📍 Coletas que ainda fazem sentido hoje")
-        if not hoje:
-            st.info("Nenhuma coleta prevista para hoje.")
-        for r in hoje:
-            coleta_card(rows, r, prox_data)
-
-    elif painel == "FUTURO":
+        if not hoje: st.info("Nenhuma coleta prevista para hoje.")
+        for r in hoje: coleta_card(rows,r,prox_data)
+    elif painel=="FUTURO":
         st.subheader(f"🌅 Programação — {data_br(prox_data)}")
-        if not futuro:
-            st.info("Nenhuma coleta programada para o próximo dia útil.")
-        for r in futuro:
-            coleta_card(rows, r, prox_data)
-
+        grupos=rota_futura_grupos(futuro)
+        if not futuro: st.info("Nenhuma coleta programada para o próximo dia útil.")
+        for nome,grupo in grupos:
+            if grupo:
+                st.markdown(f"### 🚚 {nome}")
+                for r in grupo: coleta_card(rows,r,prox_data)
+                st.info("🏢 Ao finalizar este ciclo: levar as coletas para a loja.")
     else:
         st.subheader("⏳ Todas as pendências")
-        if not pendentes:
-            st.info("Nenhuma pendência.")
-        for r in pendentes:
-            coleta_card(rows, r, prox_data)
-
+        if not pendentes: st.info("Nenhuma pendência.")
+        for r in pendentes: coleta_card(rows,r,prox_data)
     if sem_cep:
         with st.expander(f"⚠️ {len(sem_cep)} coleta(s) sem CEP válido"):
-            for r in sem_cep:
-                st.write(f"**{r.get('num_coleta','')} — {r.get('cliente','')}**")
+            for r in sem_cep: st.write(f"**{r.get('num_coleta','')} — {r.get('cliente','')}**")
 
-with tab2:
+elif menu == "➕ Nova coleta":
     st.subheader("➕ Nova coleta")
-    with st.form("nova_coleta", clear_on_submit=True):
-        a,b,c = st.columns(3)
-        numero = a.text_input("Número da coleta")
-        cep = b.text_input("CEP", placeholder="00000-000")
-        cliente = c.text_input("Cliente")
+    if st.session_state.get("nova_ok"):
+        st.success(st.session_state.pop("nova_ok"))
+    with st.form("nova_coleta",clear_on_submit=True,enter_to_submit=False):
+        a,b,c=st.columns(3)
+        numero=a.text_input("Número da coleta"); cep=b.text_input("CEP",placeholder="00000-000"); cliente=c.text_input("Cliente")
+        a,b=st.columns(2)
+        valor_nf=a.number_input("Valor da NF",min_value=0.0,step=100.0,format="%.2f")
+        prioridade=b.selectbox("Prioridade operacional",["Normal","Prioritária","Próxima coleta"])
+        observacoes=st.text_area("Observações")
+        salvar=st.form_submit_button("💾 SALVAR COLETA",type="primary",use_container_width=True)
+    if salvar:
+        cep_ok=normcep(cep)
+        if not numero.strip() or not cliente.strip() or regiao(cep_ok)=="SEM CEP": st.error("Preencha número da coleta, cliente e um CEP válido.")
+        elif any(str(r.get("num_coleta","")).strip()==numero.strip() and str(r.get("cliente","")).upper()==cliente.strip().upper() and r.get("status")!="CANCELADO" for r in rows): st.error("⚠️ Esta coleta já está cadastrada para este cliente. Verifique antes de salvar novamente.")
+        else:
+            if prioridade=="Próxima coleta":
+                for r in rows:
+                    if r.get("prioridade_operacional")=="Próxima coleta": r["prioridade_operacional"]="Normal"
+            nova={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"num_coleta":numero.strip(),"cep":cep_ok,"cliente":cliente.strip().upper(),"valor_nf":float(valor_nf),"observacoes":observacoes.strip(),"solicitado_em":datetime.now().isoformat(timespec="seconds"),"motorista":"","status":"PENDENTE","prioridade_operacional":prioridade}
+            rows.append(nova); save(rows); st.session_state.nova_ok=f"✅ Coleta {numero.strip()} — {cliente.strip().upper()} salva com sucesso!"; st.rerun()
 
-        a,b = st.columns(2)
-        valor_nf = a.number_input("Valor da NF", min_value=0.0, step=100.0, format="%.2f")
-        qtd_tipos = b.number_input("Quantidade de tipos de volume", min_value=1, max_value=10, value=1, step=1)
+elif menu == "💬 Resumo WhatsApp":
+    st.subheader("💬 Resumo para WhatsApp"); st.caption("Mensagem pronta para copiar e enviar ao time.")
+    st.text_area("Programação",value=resumo_whatsapp(rows),height=480)
+    st.info("Copie a mensagem acima. No WhatsApp, os textos entre *asteriscos* aparecem em negrito.")
 
-        st.markdown("#### 📦 Volumes / peso / medidas")
-        itens = []
-        for i in range(int(qtd_tipos)):
-            x1,x2,x3,x4 = st.columns([1,1,1.5,2])
-            volumes = x1.number_input(f"Volumes {i+1}", min_value=1, value=1, step=1, key=f"vol_{i}")
-            peso = x2.number_input(f"Peso kg {i+1}", min_value=0.0, value=0.0, step=0.1, key=f"peso_{i}")
-            medidas = x3.text_input(f"Medidas {i+1}", placeholder="40x30x25 cm", key=f"med_{i}")
-            descricao = x4.text_input(f"Descrição {i+1}", placeholder="Opcional", key=f"desc_{i}")
-            itens.append({"volumes":int(volumes),"peso_kg":float(peso),"medidas":medidas.strip(),"descricao":descricao.strip()})
+elif menu == "🗺️ Rota manual":
+    st.subheader("🗺️ Montar rota manual")
+    data_rota=st.date_input("Data da rota",value=prox_data)
+    candidatos=[r for r in rows if r.get("status","PENDENTE") not in ("COLETADO","ENTREGUE NA LOJA","FINALIZADO","CANCELADO") and (parse_date(r.get("programado_para")) in (None,data_rota) or data_rota==prox_data)]
+    st.caption("Defina 1, 2, 3... para a sequência desejada. Zero deixa a coleta fora da rota manual. A rota manual prevalece sobre a sugestão automática.")
+    with st.form("rota_manual_form",enter_to_submit=False):
+        ordens={}
+        for r in sorted(candidatos,key=ordem_futuro):
+            c1,c2=st.columns([5,1])
+            c1.markdown(f"**{r.get('cliente','')}** · {r.get('cep','')} · Coleta {r.get('num_coleta','')} · {money(r.get('valor_nf',0))}")
+            atual=int(r.get("rota_manual_ordem") or 0) if parse_date(r.get("programado_para"))==data_rota else 0
+            ordens[r['id']]=c2.number_input("Ordem",min_value=0,max_value=99,value=atual,step=1,key=f"ord_{r['id']}",label_visibility="collapsed")
+        salvar_rota=st.form_submit_button("💾 Salvar rota manual",type="primary",use_container_width=True)
+    if salvar_rota:
+        usados=[v for v in ordens.values() if v>0]
+        if len(usados)!=len(set(usados)): st.error("Não repita o mesmo número de ordem em duas coletas.")
+        else:
+            for r in rows:
+                if r.get("id") in ordens:
+                    o=int(ordens[r['id']]); r["rota_manual_ordem"]=o if o>0 else None
+                    if o>0: r["programado_para"]=data_rota.isoformat()
+            save(rows); st.success("✅ Rota manual salva com sucesso.")
+    if st.button("↩️ Voltar esta data para rota automática",use_container_width=True):
+        for r in rows:
+            if parse_date(r.get("programado_para"))==data_rota: r["rota_manual_ordem"]=None
+        save(rows); st.rerun()
 
-        observacoes = st.text_area("Observações")
-        salvar = st.form_submit_button("💾 Salvar coleta", type="primary", use_container_width=True)
-
-        if salvar:
-            cep_ok = normcep(cep)
-            if not numero.strip() or not cliente.strip() or regiao(cep_ok) == "SEM CEP":
-                st.error("Preencha número da coleta, cliente e um CEP válido.")
-            else:
-                nova = {
-                    "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
-                    "num_coleta": numero.strip(),
-                    "cep": cep_ok,
-                    "cliente": cliente.strip().upper(),
-                    "valor_nf": float(valor_nf),
-                    "itens": itens,
-                    "observacoes": observacoes.strip(),
-                    "solicitado_em": datetime.now().isoformat(timespec="seconds"),
-                    "motorista": "",
-                    "status": "PENDENTE"
-                }
-                rows.append(nova)
-                save(rows)
-                st.success("Coleta salva.")
-                st.rerun()
-
-with tab3:
-    st.subheader("💬 Resumo para WhatsApp")
-    st.caption("Mensagem pronta para copiar e enviar ao time.")
-    mensagem = resumo_whatsapp(rows)
-    st.text_area("Programação", value=mensagem, height=390)
-    st.info("No WhatsApp, os textos entre *asteriscos* aparecem em negrito.")
-
-with tab4:
+else:
     st.subheader("📊 Histórico / Excel")
     if rows:
-        df = pd.DataFrame(rows)
-        colunas = [c for c in [
-            "num_coleta","cep","cliente","valor_nf","motorista","status",
-            "solicitado_em","liberada_em","coletado_em","entregue_loja_em","data_coleta","programado_para","observacoes"
-        ] if c in df.columns]
-        st.dataframe(df[colunas], use_container_width=True, hide_index=True)
+        df=pd.DataFrame(rows)
+        colunas=[c for c in ["num_coleta","cep","cliente","valor_nf","prioridade_operacional","rota_manual_ordem","motorista","status","solicitado_em","liberada_em","coletado_em","entregue_loja_em","data_coleta","programado_para","observacoes"] if c in df.columns]
+        st.dataframe(df[colunas],use_container_width=True,hide_index=True)
+        bio=BytesIO()
+        with pd.ExcelWriter(bio,engine="openpyxl") as writer: df.to_excel(writer,index=False,sheet_name="Coletas")
+        st.download_button("⬇️ Baixar backup em Excel",data=bio.getvalue(),file_name=f"coletas_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+        st.markdown("### ✏️ Editar / corrigir coleta")
+        opcoes={f"{r.get('num_coleta','')} — {r.get('cliente','')} — {r.get('status','')}":r for r in rows}
+        escolha=st.selectbox("Selecione uma coleta",[""]+list(opcoes.keys()))
+        if escolha: formulario_edicao(rows,opcoes[escolha])
+    else: st.info("Nenhum registro.")
 
-        excel_path = Path(__file__).with_name("backup_coletas.xlsx")
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Coletas")
-        st.download_button(
-            "⬇️ Baixar backup em Excel",
-            data=excel_path.read_bytes(),
-            file_name=f"coletas_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-    else:
-        st.info("Nenhum registro.")
-
-st.caption("Controle de Coletas · V1.7 GitHub/Streamlit")
+st.caption("Controle de Coletas · V1.8 GitHub/Streamlit")
