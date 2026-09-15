@@ -97,17 +97,35 @@ def github_write(rows):
     return True
 
 def save(rows):
-    # Sempre mantém cópia local quando estiver rodando no PC.
+    """Salva e mantém a versão recém-gravada como fonte imediata da sessão."""
+    snapshot = json.loads(json.dumps(rows, ensure_ascii=False, default=str))
+    st.session_state["_rows_cache"] = snapshot
+
+    # Backup local quando estiver rodando no PC.
     try:
-        DB.write_text(json.dumps(rows, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        DB.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8"
+        )
     except Exception:
         pass
-    try:
-        github_write(rows)
-    except Exception as exc:
-        st.warning(f"Os dados foram salvos localmente, mas houve falha ao sincronizar com o GitHub: {exc}")
 
-def load():
+    # Persistência principal quando GitHub estiver configurado.
+    try:
+        github_write(snapshot)
+        st.session_state["_sync_ok"] = True
+    except Exception as exc:
+        st.session_state["_sync_ok"] = False
+        st.session_state["_sync_erro"] = str(exc)
+
+def load(force_remote=False):
+    """
+    Em reruns da mesma sessão usa o snapshot recém-salvo.
+    Isso evita voltar visualmente ao status anterior logo após clicar em uma ação.
+    """
+    if not force_remote and "_rows_cache" in st.session_state:
+        return json.loads(json.dumps(st.session_state["_rows_cache"]))
+
     rows = None
     try:
         rows = github_read()
@@ -124,7 +142,10 @@ def load():
             rows = []
 
     ids = {str(r.get("id","")) for r in rows}
-    keys = {(str(r.get("num_coleta","")), str(r.get("cliente","")), str(r.get("cep",""))) for r in rows}
+    keys = {
+        (str(r.get("num_coleta","")), str(r.get("cliente","")), str(r.get("cep","")))
+        for r in rows
+    }
     changed = False
     for r in INITIAL_ROWS:
         key = (str(r.get("num_coleta","")), str(r.get("cliente","")), str(r.get("cep","")))
@@ -133,6 +154,8 @@ def load():
             ids.add(r["id"])
             keys.add(key)
             changed = True
+
+    st.session_state["_rows_cache"] = json.loads(json.dumps(rows, ensure_ascii=False, default=str))
     if changed:
         save(rows)
     return rows
@@ -425,7 +448,10 @@ def resumo_whatsapp(rows, agora=None):
         for i,r in enumerate(grupo,1):
             tag="🚨 " if r.get("prioridade_operacional")=="Próxima coleta" else ("⭐ " if priority(r.get("cliente")) or r.get("prioridade_operacional")=="Prioritária" else "")
             linhas.append(f"{i}. {tag}*{r.get('cliente','')}* | {r.get('cep','')} | Coleta {r.get('num_coleta','')}")
-        linhas.append("🏢 *Retornar e deixar as coletas na loja*")
+            if r.get("voltar_loja_depois"):
+                linhas.append("🏢 *Depois desta coleta: retornar à loja e descarregar*")
+        if grupo and not grupo[-1].get("voltar_loja_depois"):
+            linhas.append("🏢 *Ao finalizar este ciclo: retornar e deixar as coletas na loja*")
     if not houve: linhas.append("• Nenhuma coleta programada.")
     if sem_cep:
         linhas += ["", "⚠️ *PENDÊNCIAS SEM CEP*"]
@@ -548,9 +574,11 @@ def coleta_card(rows, r, prox_data):
                 r["prioridade_operacional"] = "Normal"
             r["ordem_manual"] = None
             save(rows)
-            st.session_state["menu_principal"] = "📍 Planejamento"
-            st.session_state["painel_planejamento"] = "PROXIMA"
-            st.session_state["flash_operacional"] = f"✅ Coleta {r.get('num_coleta','')} confirmada como coletada."
+            st.session_state["painel"] = "PROXIMA"
+            st.session_state["flash_operacional"] = (
+                f"✅ Coleta {r.get('num_coleta','')} confirmada como coletada. "
+                "Próxima ação recalculada."
+            )
             st.rerun()
     elif status == "EM ROTA":
         st.info("🚚 Motorista em rota para esta coleta.")
@@ -628,19 +656,29 @@ with top2:
     st.caption(f"👤 {st.session_state.get('usuario','')}")
     if st.button("Sair", use_container_width=True):
         st.session_state.authenticated = False
+        st.session_state.pop("_rows_cache", None)
         st.rerun()
 
 if github_config()[0] and github_config()[1]:
-    st.caption("☁️ Dados sincronizados com banco JSON no GitHub")
+    if st.session_state.get("_sync_ok", True):
+        st.caption("☁️ Persistência GitHub configurada")
+    else:
+        st.warning("⚠️ Última sincronização com o GitHub falhou. A sessão atual mantém os dados; confira os Secrets.")
 else:
     st.caption("💻 Modo local — configure os Secrets do GitHub antes de publicar para não depender do arquivo local")
 
-menu = st.radio("Navegação", ["📍 Planejamento","➕ Nova coleta","💬 Resumo WhatsApp","🗺️ Rota manual","📊 Histórico / Excel"], horizontal=True, label_visibility="collapsed")
+def _mudou_menu():
+    if st.session_state.get("menu_nav") == "📍 Planejamento":
+        st.session_state["painel"] = "PROXIMA"
 
-if st.session_state.get("menu_anterior") != menu:
-    if menu == "📍 Planejamento":
-        st.session_state.painel = "PROXIMA"
-    st.session_state.menu_anterior = menu
+menu = st.radio(
+    "Navegação",
+    ["📍 Planejamento","➕ Nova coleta","💬 Resumo WhatsApp","🗺️ Rota manual","📊 Histórico / Excel"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="menu_nav",
+    on_change=_mudou_menu
+)
 
 flash = st.session_state.pop("flash", None)
 if flash:
@@ -670,9 +708,10 @@ if menu == "📍 Planejamento":
                 for base in rows:
                     if base.get("status")=="COLETADO": registrar_status(base,"ENTREGUE NA LOJA",st.session_state.get("usuario","")); base["entregue_loja_em"]=agora_txt
                 save(rows)
-                st.session_state["menu_principal"]="📍 Planejamento"
-                st.session_state["painel_planejamento"]="PROXIMA"
-                st.session_state["flash_operacional"]="🏢 Coletas descarregadas na loja. Próxima ação recalculada."
+                st.session_state["painel"] = "PROXIMA"
+                st.session_state["flash_operacional"] = (
+                    "🏢 Coletas descarregadas na loja. Próxima ação recalculada."
+                )
                 st.rerun()
         else:
             st.subheader("✅ Operação atual concluída")
@@ -784,4 +823,4 @@ else:
     else: st.info("Nenhum registro.")
 
 st.session_state["_menu_anterior"] = menu
-st.caption("Controle de Coletas · V1.10 GitHub/Streamlit")
+st.caption("Controle de Coletas · V1.11 REVISADO")
