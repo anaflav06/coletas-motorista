@@ -215,13 +215,23 @@ def prioridade_manual_rank(r):
     p = str(r.get("prioridade_operacional", "Normal"))
     return {"Próxima coleta": 0, "Prioritária": 1, "Normal": 2}.get(p, 2)
 
+def cliente_inicio_rota(r):
+    """Regra operacional: estes clientes devem ser atendidos no início da rota, com o veículo vazio."""
+    nome = str(r.get("cliente","")).strip().upper()
+    return nome in {"R&E FOLHEADOS", "ROGER BIJU"} and normcep(r.get("cep","")) == "01004-010"
+
 def ordem_operacional(r):
-    # Intervenção manual sempre prevalece. Depois entram prioridades comerciais e a rota automática.
+    # Próxima coleta manual continua sendo ordem direta da operação.
     manual = prioridade_manual_rank(r)
+    # R&E/ROGER vêm no início da rota automática por regra de segurança.
+    seguranca = 0 if cliente_inicio_rota(r) else 1
     pri_cliente = 0 if priority(r.get("cliente")) else 1
     rg = {"LONGE":0, "PERTO":1, "MUITO PERTO":2}.get(regiao(r.get("cep")), 3)
-    # NF menor antes da maior quando as coletas são compatíveis no mesmo roteiro.
-    return (manual, pri_cliente, rg, -head(r.get("cep")), float(r.get("valor_nf") or 0))
+    try:
+        nf = float(r.get("valor_nf",0) or 0)
+    except Exception:
+        nf = 0
+    return (manual, seguranca, pri_cliente, rg, cep_head(r.get("cep")), nf)
 
 def ordem_futuro(r):
     # Rota manual salva para a data tem precedência absoluta.
@@ -442,7 +452,7 @@ def formulario_edicao(rows, r):
             st.rerun()
 
 def coleta_card(rows, r, prox_data):
-    estrela = "⭐ " if priority(r.get("cliente")) else ""
+    estrela = "🛡️ " if cliente_inicio_rota(r) else ("⭐ " if priority(r.get("cliente")) else "")
     st.markdown(
         f"""<div class="coleta-card">
         <div class="coleta-title">{estrela}{r.get('cliente','')} <span>— {r.get('cep','')}</span></div>
@@ -475,10 +485,18 @@ def coleta_card(rows, r, prox_data):
     elif status == "LIBERADA":
         st.success("✅ Coleta liberada para o motorista.")
         if st.button("📦 Marcar como coletada", key=f"col_{r['id']}", use_container_width=True):
-            registrar_status(r,"COLETADO",st.session_state.get("usuario",""))
-            r["data_coleta"]=datetime.now().date().isoformat(); r["coletado_em"]=datetime.now().isoformat(timespec="seconds")
-            if r.get("prioridade_operacional")=="Próxima coleta": r["prioridade_operacional"]="Normal"
-            save(rows); st.rerun()
+            agora = datetime.now()
+            registrar_status(r, "COLETADO", st.session_state.get("usuario",""))
+            r["data_coleta"] = agora.date().isoformat()
+            r["coletado_em"] = agora.isoformat(timespec="seconds")
+            # A ordem "Próxima coleta" vale apenas até a execução.
+            if r.get("prioridade_operacional") == "Próxima coleta":
+                r["prioridade_operacional"] = "Normal"
+            r["ordem_manual"] = None
+            save(rows)
+            st.session_state["painel"] = "PROXIMA"
+            st.session_state["flash_operacional"] = f"✅ Coleta {r.get('num_coleta','')} confirmada como coletada."
+            st.rerun()
     elif status == "EM ROTA":
         st.info("🚚 Motorista em rota para esta coleta.")
     elif status == "COLETADO":
@@ -540,6 +558,10 @@ if not login_screen():
     st.stop()
 
 rows = load()
+flash_operacional = st.session_state.pop("flash_operacional", None)
+if flash_operacional:
+    st.success(flash_operacional)
+
 prox_data = proximo_dia_util()
 hoje, futuro, sem_cep = separar_programacao(rows)
 
@@ -687,4 +709,4 @@ else:
         if escolha: formulario_edicao(rows,opcoes[escolha])
     else: st.info("Nenhum registro.")
 
-st.caption("Controle de Coletas · V1.8 GitHub/Streamlit")
+st.caption("Controle de Coletas · V1.9 GitHub/Streamlit")
