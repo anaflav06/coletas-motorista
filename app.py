@@ -215,6 +215,16 @@ def prioridade_manual_rank(r):
     p = str(r.get("prioridade_operacional", "Normal"))
     return {"Próxima coleta": 0, "Prioritária": 1, "Normal": 2}.get(p, 2)
 
+def cep_head(cep):
+    """Retorna os 3 primeiros dígitos numéricos do CEP para ordenação operacional."""
+    n = re.sub(r"\D", "", str(cep or ""))
+    if len(n) < 3:
+        return 999
+    try:
+        return int(n[:3])
+    except Exception:
+        return 999
+
 def cliente_inicio_rota(r):
     """Regra operacional: estes clientes devem ser atendidos no início da rota, com o veículo vazio."""
     nome = str(r.get("cliente","")).strip().upper()
@@ -709,4 +719,4 @@ else:
         if escolha: formulario_edicao(rows,opcoes[escolha])
     else: st.info("Nenhum registro.")
 
-st.caption("Controle de Coletas · V1.9 GitHub/Streamlit")
+st.caption("Controle de Coletas · V1.9.1 GitHub/Streamlit")
